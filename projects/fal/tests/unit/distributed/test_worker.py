@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import socket
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,6 +10,7 @@ from fal.distributed.worker import (
     DistributedRunner,
     DistributedWorker,
     _free_ports,
+    _is_port_collision,
 )
 
 
@@ -60,6 +62,29 @@ def test_runner_honours_explicitly_passed_ports():
     )
     assert runner.worker_port == 54923
     assert runner.master_port == 29500
+
+
+def test_zmq_bind_failure_is_a_port_collision():
+    """Test that a ZMQError carrying EADDRINUSE is recognised through the wrapper."""
+    wrapped = RuntimeError("Failed to start distributed processes.")
+    wrapped.__cause__ = OSError(errno.EADDRINUSE, "Address already in use")
+    assert _is_port_collision(wrapped)
+
+
+def test_torch_bind_failure_is_a_port_collision():
+    """Test that torch's message-only bind failure is recognised too."""
+    wrapped = RuntimeError("Failed to start distributed processes.")
+    wrapped.__cause__ = RuntimeError(
+        "The server socket has failed to bind: Address already in use"
+    )
+    assert _is_port_collision(wrapped)
+
+
+def test_an_unrelated_startup_failure_is_not_a_port_collision():
+    """Test that a real failure is not retried behind three more startups."""
+    wrapped = RuntimeError("Failed to start distributed processes.")
+    wrapped.__cause__ = RuntimeError("CUDA error: invalid device ordinal")
+    assert not _is_port_collision(wrapped)
 
 
 def test_runner_initialization():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import inspect
 import os
 import pickle
@@ -242,6 +243,22 @@ def _free_ports(count: int) -> list[int]:
     finally:
         for sock in socks:
             sock.close()
+
+
+def _is_port_collision(error: BaseException) -> bool:
+    """Whether a failed start lost a race to bind one of its ports.
+
+    ZMQ raises ZMQError carrying an errno; torch.distributed raises a bare
+    RuntimeError naming the condition, hence both checks.
+    """
+    for exc in (error, error.__cause__, error.__context__):
+        if exc is None:
+            continue
+        if getattr(exc, "errno", None) == errno.EADDRINUSE:
+            return True
+        if "address already in use" in str(exc).lower():
+            return True
+    return False
 
 
 class DistributedRunner:
@@ -591,15 +608,48 @@ class DistributedRunner:
         socket.send_multipart([b"EXIT"])
         socket.close()
 
-    async def start(self, timeout: int = 1800, **kwargs: Any) -> None:
+    async def start(
+        self, timeout: int = 1800, attempts: int = 3, **kwargs: Any
+    ) -> None:
         """
         Starts the distributed worker processes.
         :param timeout: The timeout for the distributed processes.
+        :param attempts: How many times to redraw automatically-picked ports and
+            try again when another process wins the race to bind one. A redraw
+            succeeds because whatever took the port has bound it by then, so the
+            kernel will not offer it a second time.
         """
-        import zmq
-
         if self.is_alive():
             raise RuntimeError("Distributed processes are already running.")
+
+        # Only ports we picked may be redrawn. One the caller passed is their
+        # choice, and a collision on it is theirs to see.
+        auto_master = self.master_port is None
+        auto_worker = self.worker_port is None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                await self._start_once(timeout, **kwargs)
+                return
+            except RuntimeError as e:
+                if (
+                    attempt == attempts
+                    or not (auto_master or auto_worker)
+                    or not _is_port_collision(e)
+                ):
+                    raise
+                if auto_master:
+                    self.master_port = None
+                if auto_worker:
+                    self.worker_port = None
+                print(
+                    f"[debug] A port was taken between picking it and binding "
+                    f"it; drawing again ({attempt}/{attempts})."
+                )
+
+    async def _start_once(self, timeout: int, **kwargs: Any) -> None:
+        """One attempt at starting the workers, with the ports as they stand."""
+        import zmq
 
         self._keepalive_shutdown = False
 
