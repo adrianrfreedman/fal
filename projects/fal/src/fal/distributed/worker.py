@@ -5,6 +5,7 @@ import inspect
 import os
 import pickle
 import queue
+import socket
 import threading
 import time
 import traceback
@@ -218,6 +219,20 @@ class DistributedWorker:
         return {}
 
 
+def _free_port() -> int:
+    """Return an ephemeral port that is free right now.
+
+    The caller has to know the port before anything binds it: worker processes
+    are spawned with worker_port baked in, and torch.distributed binds
+    MASTER_PORT itself. So this closes the socket and hands back the number,
+    which leaves a small window in which something else could take the port --
+    far smaller than the one a fixed default leaves open.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
 class DistributedRunner:
     """
     A class to launch and manage distributed workers.
@@ -233,9 +248,9 @@ class DistributedRunner:
         worker_cls: type[DistributedWorker] = DistributedWorker,
         world_size: int = 1,
         master_addr: str = "127.0.0.1",
-        master_port: int = 29500,
+        master_port: Optional[int] = None,
         worker_addr: str = "127.0.0.1",
-        worker_port: int = 54923,
+        worker_port: Optional[int] = None,
         timeout: int = 86400,  # 24 hours
         keepalive_payload: dict[str, Any] = {},
         keepalive_interval: Optional[Union[int, float]] = None,
@@ -576,6 +591,14 @@ class DistributedRunner:
             raise RuntimeError("Distributed processes are already running.")
 
         self._keepalive_shutdown = False
+
+        # Resolved here rather than in __init__ to keep the gap between picking
+        # a port and binding it short, and before launch_distributed_processes
+        # because the worker processes are spawned with worker_port baked in.
+        if self.master_port is None:
+            self.master_port = _free_port()
+        if self.worker_port is None:
+            self.worker_port = _free_port()
 
         self.context = launch_distributed_processes(
             self.run,

@@ -1,4 +1,5 @@
 import asyncio
+import socket
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -7,6 +8,7 @@ from fal.distributed.utils import distributed_serialize
 from fal.distributed.worker import (
     DistributedRunner,
     DistributedWorker,
+    _free_port,
 )
 
 
@@ -29,6 +31,29 @@ def test_worker_task_submission():
     result = future.result()
     assert result == {"status": "ok"}
     worker.shutdown()
+
+
+def test_free_port_returns_a_bindable_port():
+    """Test that _free_port hands back a port that is actually free."""
+    port = _free_port()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", port))  # raises if the port was not free
+
+
+def test_runner_does_not_default_to_a_fixed_port():
+    """Test that ports are left unresolved so two runners on a host do not collide."""
+    runner = DistributedRunner(SimpleWorker, world_size=1)
+    assert runner.worker_port is None
+    assert runner.master_port is None
+
+
+def test_runner_honours_explicitly_passed_ports():
+    """Test that passing a port still pins it."""
+    runner = DistributedRunner(
+        SimpleWorker, world_size=1, worker_port=54923, master_port=29500
+    )
+    assert runner.worker_port == 54923
+    assert runner.master_port == 29500
 
 
 def test_runner_initialization():
