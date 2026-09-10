@@ -220,29 +220,16 @@ class DistributedWorker:
         return {}
 
 
-def _free_ports(count: int) -> list[int]:
-    """Return `count` ephemeral ports that are free right now, all distinct.
+def _free_port() -> int:
+    """Return an ephemeral port that is free right now.
 
-    The caller has to know the ports before anything binds them: worker
-    processes are spawned with worker_port baked in, and torch.distributed binds
-    MASTER_PORT itself. Every socket is held until all of them are bound, so the
-    kernel cannot hand out the same port twice -- a bind-then-close releases it
-    immediately, since a socket that never connected does not enter TIME_WAIT.
-
-    Closing them all at the end still leaves a window in which something else
-    could take a port, but it is far smaller than the one a fixed default leaves
-    open.
+    Only for MASTER_PORT, which torch.distributed binds itself from the
+    environment, so there is no socket to hold in the meantime. The worker port
+    does not go through here: it is claimed with bind_to_random_port instead.
     """
-    socks = []
-    try:
-        for _ in range(count):
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.bind(("127.0.0.1", 0))
-            socks.append(sock)
-        return [sock.getsockname()[1] for sock in socks]
-    finally:
-        for sock in socks:
-            sock.close()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def _is_port_collision(error: BaseException) -> bool:
@@ -411,6 +398,22 @@ class DistributedRunner:
         socket.bind(f"tcp://{self.worker_addr}:{self.worker_port}")
         self.zmq_socket = socket
         return socket
+
+    def _bind_worker_socket(self) -> Socket[Any]:
+        """Bind the ROUTER socket, claiming a port atomically when none was set.
+
+        :return: The bound socket. The caller owns it until it is safe to store.
+        """
+        import zmq
+        import zmq.asyncio
+
+        context = zmq.asyncio.Context()
+        sock = context.socket(zmq.ROUTER)
+        if self.worker_port is None:
+            self.worker_port = sock.bind_to_random_port(f"tcp://{self.worker_addr}")
+        else:
+            sock.bind(f"tcp://{self.worker_addr}:{self.worker_port}")
+        return sock
 
     def close_zmq_socket(self) -> None:
         """
@@ -656,26 +659,38 @@ class DistributedRunner:
         # Resolved here rather than in __init__ to keep the gap between picking
         # a port and binding it short, and before launch_distributed_processes
         # because the worker processes are spawned with worker_port baked in.
-        if self.master_port is None or self.worker_port is None:
-            ports = _free_ports(2)
-            if self.master_port is None:
-                self.master_port = ports[0]
-            if self.worker_port is None:
-                self.worker_port = ports[1]
+        # Bound first, so the worker port is claimed rather than merely chosen:
+        # bind_to_random_port picks and binds in one step, leaving no moment
+        # where the number is known but the port is still free for the taking.
+        # Held in a local, not on self, because mp.spawn cloudpickles self.run
+        # and so self into every child, and a bound socket cannot be pickled.
+        worker_socket = self._bind_worker_socket()
 
-        self.context = launch_distributed_processes(
-            self.run,
-            world_size=self.world_size,
-            master_addr=self.master_addr,
-            master_port=self.master_port,
-            timeout=self.timeout,
-            cwd=self.cwd,
-            **kwargs,
-        )
+        # After the bind above, so the kernel cannot offer the port it just took.
+        # This one is only chosen, not claimed -- torch.distributed binds
+        # MASTER_PORT itself -- which is why start() still retries.
+        if self.master_port is None:
+            self.master_port = _free_port()
+
+        try:
+            self.context = launch_distributed_processes(
+                self.run,
+                world_size=self.world_size,
+                master_addr=self.master_addr,
+                master_port=self.master_port,
+                timeout=self.timeout,
+                cwd=self.cwd,
+                **kwargs,
+            )
+        except BaseException:
+            worker_socket.close()
+            raise
+
+        self.zmq_socket = worker_socket
 
         try:
             ready_workers: set[int] = set()
-            socket = self.get_zmq_socket()
+            socket = worker_socket
             start_time = time.perf_counter()
 
             while len(ready_workers) < self.world_size:

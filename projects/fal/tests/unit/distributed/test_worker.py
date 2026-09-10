@@ -9,7 +9,7 @@ from fal.distributed.utils import distributed_serialize
 from fal.distributed.worker import (
     DistributedRunner,
     DistributedWorker,
-    _free_ports,
+    _free_port,
     _is_port_collision,
 )
 
@@ -35,17 +35,41 @@ def test_worker_task_submission():
     worker.shutdown()
 
 
-def test_free_ports_returns_bindable_ports():
-    """Test that _free_ports hands back ports that are actually free."""
-    for port in _free_ports(2):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", port))  # raises if the port was not free
+def test_free_port_returns_a_bindable_port():
+    """Test that _free_port hands back a port that is actually free."""
+    port = _free_port()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", port))  # raises if the port was not free
 
 
-def test_free_ports_never_repeats_a_port():
-    """Test that picking several ports does not hand the same one back twice."""
-    ports = _free_ports(8)
-    assert len(set(ports)) == 8
+def test_bind_worker_socket_claims_a_port_and_holds_it():
+    """Test that the ROUTER port is bound, not merely chosen."""
+    pytest.importorskip("zmq")
+
+    runner = DistributedRunner(SimpleWorker, world_size=1)
+    sock = runner._bind_worker_socket()
+    try:
+        assert runner.worker_port is not None
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            with pytest.raises(OSError):
+                probe.bind(("127.0.0.1", runner.worker_port))
+    finally:
+        sock.close()
+
+
+def test_bind_worker_socket_honours_an_explicit_port():
+    """Test that a port the caller passed is the one bound."""
+    pytest.importorskip("zmq")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        free = probe.getsockname()[1]
+    runner = DistributedRunner(SimpleWorker, world_size=1, worker_port=free)
+    sock = runner._bind_worker_socket()
+    try:
+        assert runner.worker_port == free
+    finally:
+        sock.close()
 
 
 def test_runner_does_not_default_to_a_fixed_port():
