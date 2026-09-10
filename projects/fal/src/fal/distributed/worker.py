@@ -252,6 +252,10 @@ class DistributedRunner:
         self.cwd = cwd
         self.zmq_socket = None
         self.master_store = None
+        # Only ports we claimed get redrawn on release; one the caller pinned is
+        # theirs and stays pinned.
+        self._auto_worker_port = worker_port is None
+        self._auto_master_port = master_port is None
         self.context = None
         self.keepalive_payload = keepalive_payload
         self.keepalive_interval = keepalive_interval
@@ -320,6 +324,8 @@ class DistributedRunner:
                     process.terminate()
                     process.join(timeout=timeout)
 
+        self._release_ports()
+
     def gather_errors(self) -> list[Exception]:
         """
         Gathers errors from the distributed worker processes.
@@ -381,6 +387,9 @@ class DistributedRunner:
         import zmq
         import zmq.asyncio
 
+        if self.zmq_socket is not None:
+            return self.zmq_socket
+
         context = zmq.asyncio.Context()
         sock = context.socket(zmq.ROUTER)
         if self.worker_port is None:
@@ -400,10 +409,29 @@ class DistributedRunner:
         """
         import torch.distributed as dist
 
+        if self.master_store is not None:
+            return self.master_store
+
         # world_size None: the parent serves the store without being a rank in it.
+        # torch counts store users as clients + 1 for the server, so the group's
+        # world_size would be wrong here, and None also skips the join barrier.
         store = dist.TCPStore(self.master_addr, self.master_port or 0, None, True)
         self.master_port = store.port
         return store
+
+    def _release_ports(self) -> None:
+        """Give up the claimed ports, so a later start() claims fresh ones.
+
+        Without this a second start() would rebind a port the first one is still
+        holding, and the store's socket and thread would outlive the runner.
+        """
+        self.close_zmq_socket()
+        # TCPStore has no close(); dropping the last reference shuts it down.
+        self.master_store = None
+        if self._auto_worker_port:
+            self.worker_port = None
+        if self._auto_master_port:
+            self.master_port = None
 
     def close_zmq_socket(self) -> None:
         """
@@ -631,7 +659,9 @@ class DistributedRunner:
                 **kwargs,
             )
         except BaseException:
-            worker_socket.close()
+            self.zmq_socket = worker_socket
+            self.master_store = master_store
+            self._release_ports()
             raise
 
         self.zmq_socket = worker_socket

@@ -78,6 +78,42 @@ def test_master_store_claims_the_port():
         del store
 
 
+def test_release_ports_frees_a_claimed_worker_port():
+    """Test that a released port is genuinely free, not merely forgotten."""
+    pytest.importorskip("zmq")
+
+    runner = DistributedRunner(SimpleWorker, world_size=1)
+    runner.zmq_socket = runner._bind_worker_socket()
+    claimed = runner.worker_port
+    runner._release_ports()
+
+    assert runner.worker_port is None  # auto-picked, so redrawn next time
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", claimed))  # raises if it was not released
+
+
+def test_release_ports_keeps_a_pinned_port():
+    """Test that a port the caller passed survives a release."""
+    pytest.importorskip("zmq")
+
+    runner = DistributedRunner(SimpleWorker, world_size=1, worker_port=0)
+    runner._release_ports()
+    assert runner.worker_port == 0
+
+
+def test_binding_twice_reuses_the_held_socket():
+    """Test that a second start does not rebind a port the first still holds."""
+    pytest.importorskip("zmq")
+
+    runner = DistributedRunner(SimpleWorker, world_size=1)
+    first = runner._bind_worker_socket()
+    runner.zmq_socket = first
+    try:
+        assert runner._bind_worker_socket() is first
+    finally:
+        runner._release_ports()
+
+
 def test_runner_initialization():
     """Test that a distributed runner can be initialized with correct parameters."""
     runner = DistributedRunner(SimpleWorker, world_size=2)
