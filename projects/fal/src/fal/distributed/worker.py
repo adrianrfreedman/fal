@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import errno
 import inspect
 import os
 import pickle
 import queue
-import socket
 import threading
 import time
 import traceback
@@ -220,34 +218,6 @@ class DistributedWorker:
         return {}
 
 
-def _free_port() -> int:
-    """Return an ephemeral port that is free right now.
-
-    Only for MASTER_PORT, which torch.distributed binds itself from the
-    environment, so there is no socket to hold in the meantime. The worker port
-    does not go through here: it is claimed with bind_to_random_port instead.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def _is_port_collision(error: BaseException) -> bool:
-    """Whether a failed start lost a race to bind one of its ports.
-
-    ZMQ raises ZMQError carrying an errno; torch.distributed raises a bare
-    RuntimeError naming the condition, hence both checks.
-    """
-    for exc in (error, error.__cause__, error.__context__):
-        if exc is None:
-            continue
-        if getattr(exc, "errno", None) == errno.EADDRINUSE:
-            return True
-        if "address already in use" in str(exc).lower():
-            return True
-    return False
-
-
 class DistributedRunner:
     """
     A class to launch and manage distributed workers.
@@ -281,6 +251,7 @@ class DistributedRunner:
         self.timeout = timeout
         self.cwd = cwd
         self.zmq_socket = None
+        self.master_store = None
         self.context = None
         self.keepalive_payload = keepalive_payload
         self.keepalive_interval = keepalive_interval
@@ -400,7 +371,10 @@ class DistributedRunner:
         return socket
 
     def _bind_worker_socket(self) -> Socket[Any]:
-        """Bind the ROUTER socket, claiming a port atomically when none was set.
+        """Bind the ROUTER socket, claiming a port when none was given.
+
+        `bind_to_random_port` picks and binds in one step, so there is no moment
+        where the port is chosen but still free for another process to take.
 
         :return: The bound socket. The caller owns it until it is safe to store.
         """
@@ -414,6 +388,22 @@ class DistributedRunner:
         else:
             sock.bind(f"tcp://{self.worker_addr}:{self.worker_port}")
         return sock
+
+    def _create_master_store(self) -> Any:
+        """Open the rendezvous store, claiming MASTER_PORT when none was given.
+
+        Port 0 lets TCPStore bind whatever the OS gives it and report it back, so
+        this port is claimed in one step too. The parent holds the store for the
+        runner's life and the ranks join it as clients.
+
+        :return: The store. The caller owns it until it is safe to store.
+        """
+        import torch.distributed as dist
+
+        # world_size None: the parent serves the store without being a rank in it.
+        store = dist.TCPStore(self.master_addr, self.master_port or 0, None, True)
+        self.master_port = store.port
+        return store
 
     def close_zmq_socket(self) -> None:
         """
@@ -611,66 +601,24 @@ class DistributedRunner:
         socket.send_multipart([b"EXIT"])
         socket.close()
 
-    async def start(
-        self, timeout: int = 1800, attempts: int = 3, **kwargs: Any
-    ) -> None:
+    async def start(self, timeout: int = 1800, **kwargs: Any) -> None:
         """
         Starts the distributed worker processes.
         :param timeout: The timeout for the distributed processes.
-        :param attempts: How many times to redraw automatically-picked ports and
-            try again when another process wins the race to bind one. A redraw
-            succeeds because whatever took the port has bound it by then, so the
-            kernel will not offer it a second time.
         """
+        import zmq
+
         if self.is_alive():
             raise RuntimeError("Distributed processes are already running.")
 
-        # Only ports we picked may be redrawn. One the caller passed is their
-        # choice, and a collision on it is theirs to see.
-        auto_master = self.master_port is None
-        auto_worker = self.worker_port is None
-
-        for attempt in range(1, attempts + 1):
-            try:
-                await self._start_once(timeout, **kwargs)
-                return
-            except RuntimeError as e:
-                if (
-                    attempt == attempts
-                    or not (auto_master or auto_worker)
-                    or not _is_port_collision(e)
-                ):
-                    raise
-                if auto_master:
-                    self.master_port = None
-                if auto_worker:
-                    self.worker_port = None
-                print(
-                    f"[debug] A port was taken between picking it and binding "
-                    f"it; drawing again ({attempt}/{attempts})."
-                )
-
-    async def _start_once(self, timeout: int, **kwargs: Any) -> None:
-        """One attempt at starting the workers, with the ports as they stand."""
-        import zmq
-
         self._keepalive_shutdown = False
 
-        # Resolved here rather than in __init__ to keep the gap between picking
-        # a port and binding it short, and before launch_distributed_processes
-        # because the worker processes are spawned with worker_port baked in.
-        # Bound first, so the worker port is claimed rather than merely chosen:
-        # bind_to_random_port picks and binds in one step, leaving no moment
-        # where the number is known but the port is still free for the taking.
-        # Held in a local, not on self, because mp.spawn cloudpickles self.run
-        # and so self into every child, and a bound socket cannot be pickled.
+        # Both ports are claimed before the workers are spawned, and held in
+        # locals rather than on self until the spawn is done: mp.spawn
+        # cloudpickles self.run, and so self, into every child, and neither a
+        # bound socket nor a store can be pickled.
         worker_socket = self._bind_worker_socket()
-
-        # After the bind above, so the kernel cannot offer the port it just took.
-        # This one is only chosen, not claimed -- torch.distributed binds
-        # MASTER_PORT itself -- which is why start() still retries.
-        if self.master_port is None:
-            self.master_port = _free_port()
+        master_store = self._create_master_store()
 
         try:
             self.context = launch_distributed_processes(
@@ -687,6 +635,7 @@ class DistributedRunner:
             raise
 
         self.zmq_socket = worker_socket
+        self.master_store = master_store
 
         try:
             ready_workers: set[int] = set()

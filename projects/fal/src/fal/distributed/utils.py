@@ -299,9 +299,14 @@ def wrap_distributed_worker(
     os.environ["MASTER_PORT"] = str(master_port)
 
     print(f"[debug] Worker {rank} started with PID {os.getpid()}.")
+    # A client store, not `init_method="env://"`. Under env:// rank 0 would open
+    # the server on MASTER_PORT here, which means the port is only a number until
+    # this moment and anything on the host can take it first. The parent binds it
+    # before spawning, so every rank connects rather than binding.
+    store = dist.TCPStore(master_addr, master_port, world_size, is_master=False)
     dist.init_process_group(
         backend="nccl",
-        init_method="env://",
+        store=store,
         world_size=world_size,
         rank=rank,
         timeout=datetime.timedelta(seconds=timeout),

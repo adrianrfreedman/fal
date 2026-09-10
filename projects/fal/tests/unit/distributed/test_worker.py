@@ -1,5 +1,4 @@
 import asyncio
-import errno
 import socket
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,8 +8,6 @@ from fal.distributed.utils import distributed_serialize
 from fal.distributed.worker import (
     DistributedRunner,
     DistributedWorker,
-    _free_port,
-    _is_port_collision,
 )
 
 
@@ -35,43 +32,6 @@ def test_worker_task_submission():
     worker.shutdown()
 
 
-def test_free_port_returns_a_bindable_port():
-    """Test that _free_port hands back a port that is actually free."""
-    port = _free_port()
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", port))  # raises if the port was not free
-
-
-def test_bind_worker_socket_claims_a_port_and_holds_it():
-    """Test that the ROUTER port is bound, not merely chosen."""
-    pytest.importorskip("zmq")
-
-    runner = DistributedRunner(SimpleWorker, world_size=1)
-    sock = runner._bind_worker_socket()
-    try:
-        assert runner.worker_port is not None
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            with pytest.raises(OSError):
-                probe.bind(("127.0.0.1", runner.worker_port))
-    finally:
-        sock.close()
-
-
-def test_bind_worker_socket_honours_an_explicit_port():
-    """Test that a port the caller passed is the one bound."""
-    pytest.importorskip("zmq")
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        free = probe.getsockname()[1]
-    runner = DistributedRunner(SimpleWorker, world_size=1, worker_port=free)
-    sock = runner._bind_worker_socket()
-    try:
-        assert runner.worker_port == free
-    finally:
-        sock.close()
-
-
 def test_runner_does_not_default_to_a_fixed_port():
     """Test that ports are left unresolved so two runners on a host do not collide."""
     runner = DistributedRunner(SimpleWorker, world_size=1)
@@ -88,27 +48,34 @@ def test_runner_honours_explicitly_passed_ports():
     assert runner.master_port == 29500
 
 
-def test_zmq_bind_failure_is_a_port_collision():
-    """Test that a ZMQError carrying EADDRINUSE is recognised through the wrapper."""
-    wrapped = RuntimeError("Failed to start distributed processes.")
-    wrapped.__cause__ = OSError(errno.EADDRINUSE, "Address already in use")
-    assert _is_port_collision(wrapped)
+def test_bind_worker_socket_claims_the_port():
+    """Test that the ROUTER port is bound, not merely chosen."""
+    pytest.importorskip("zmq")
+
+    runner = DistributedRunner(SimpleWorker, world_size=1)
+    sock = runner._bind_worker_socket()
+    try:
+        assert runner.worker_port is not None
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            with pytest.raises(OSError):
+                probe.bind(("127.0.0.1", runner.worker_port))
+    finally:
+        sock.close()
 
 
-def test_torch_bind_failure_is_a_port_collision():
-    """Test that torch's message-only bind failure is recognised too."""
-    wrapped = RuntimeError("Failed to start distributed processes.")
-    wrapped.__cause__ = RuntimeError(
-        "The server socket has failed to bind: Address already in use"
-    )
-    assert _is_port_collision(wrapped)
+def test_master_store_claims_the_port():
+    """Test that MASTER_PORT is bound by the parent, not left to the ranks."""
+    pytest.importorskip("torch")
 
-
-def test_an_unrelated_startup_failure_is_not_a_port_collision():
-    """Test that a real failure is not retried behind three more startups."""
-    wrapped = RuntimeError("Failed to start distributed processes.")
-    wrapped.__cause__ = RuntimeError("CUDA error: invalid device ordinal")
-    assert not _is_port_collision(wrapped)
+    runner = DistributedRunner(SimpleWorker, world_size=1)
+    store = runner._create_master_store()
+    try:
+        assert runner.master_port == store.port
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            with pytest.raises(OSError):
+                probe.bind(("127.0.0.1", runner.master_port))
+    finally:
+        del store
 
 
 def test_runner_initialization():
